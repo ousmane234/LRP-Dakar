@@ -1,0 +1,14 @@
+# Données locales (ne pas publier sur GitHub)
+*.csv
+*.geojson
+*.xlsx
+*.xls
+
+# Fichiers R temporaires
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Dossier rsconnect (tokens de déploiement — à ne jamais publier)
+rsconnect/
