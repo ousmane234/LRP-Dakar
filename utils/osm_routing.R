@@ -1,20 +1,8 @@
 # ============================================================
 #  utils/osm_routing.R
 #  Routage sur le réseau routier OSM via dodgr
-#
-#  Remplace les distances Haversine (lignes droites) par des
-#  distances et itinéraires réels sur les routes de Dakar.
-#
-#  Pourquoi dodgr et pas osrm ?
-#    - dodgr est offline : pas de quota, pas de dépendance réseau
-#    - Le graphe est construit une fois et réutilisé (cache)
-#    - dodgr_paths() retourne les géométries pour tracer les routes
-#
-#  Fonctions principales :
-#    charger_graphe_osm()        : télécharge et prépare le graphe routier
-#    matrice_distances_osm()     : remplace distm() Haversine
-#    geometries_tournees_osm()   : retourne les LINESTRING pour Leaflet
-#    snap_candidats_reseau()     : projette les centroïdes sur le réseau
+#  
+#  ⚠️ C'est la méthode PRINCIPALE pour les distances réelles
 # ============================================================
 
 library(dodgr)
@@ -22,163 +10,96 @@ library(osmdata)
 library(sf)
 library(dplyr)
 
-# ------------------------------------------------------------
-#  CACHE du graphe — évite de retélécharger à chaque run
-# ------------------------------------------------------------
-############.graphe_cache <- new.env(parent = emptyenv())
-
-
-# ------------------------------------------------------------
-#  charger_graphe_osm()
-#  Télécharge le réseau routier OSM pour Dakar et construit
-#  le graphe pondéré dodgr.
-#
-#  Arguments :
-#    bbox      : vecteur c(xmin, ymin, xmax, ymax) en WGS84
-#                Par défaut : emprise de la presqu'île de Dakar
-#    type_voie : profil de pondération dodgr ("motorcar" ou "foot")
-#    forcer    : si TRUE, ignore le cache et retélécharge
-#
-#  Retourne : graphe dodgr (data.frame pondéré)
-# ------------------------------------------------------------
-
-# charger_graphe_osm <- function(
-#         bbox      = c(-17.55, 14.60, -17.30, 14.80),   # Dakar presqu'île
-#         type_voie = "motorcar",
-#         forcer    = FALSE) {
-#     
-#     cle_cache <- paste0(type_voie, "_", paste(round(bbox, 3), collapse = "_"))
-#     
-#     if (!forcer && exists(cle_cache, envir = .graphe_cache)) {
-#         message("[OSM] Graphe chargé depuis le cache.")
-#         return(get(cle_cache, envir = .graphe_cache))
-#     }
-#     
-#     message("[OSM] Téléchargement du réseau routier OSM...")
-#     
-#     # Requête OSM : routes carrossables dans la bbox
-#     osm_raw <- opq(bbox = bbox) %>%
-#         add_osm_feature(key = "highway") %>%
-#         osmdata_sf()
-#     
-#     # Construction du graphe dodgr
-#     graphe <- weight_streetnet(
-#         osm_raw,
-#         wt_profile = type_voie,
-#         type_col   = "highway"
-#     )
-#     
-#     # Mise en cache
-#     assign(cle_cache, graphe, envir = .graphe_cache)
-#     message("[OSM] Graphe construit : ", nrow(graphe), " arêtes.")
-#     
-#     graphe
-# }
-# ------------------------------------------------------------
-#  charger_graphe_osm() avec CACHE PHYSIQUE PERSISTANT (.Rds)
-# ------------------------------------------------------------
+# Cache du graphe OSM avec fichier persistant
 charger_graphe_osm <- function(
-        bbox      = c(-17.55, 14.60, -17.30, 14.80),   # Dakar presqu'île
+        bbox      = c(-17.55, 14.60, -17.30, 14.80),
         type_voie = "motorcar",
         forcer    = FALSE) {
     
-    # 1. Définir un nom de fichier unique basé sur les paramètres
-    cle_cache  <- paste0(type_voie, "_", paste(round(bbox, 3), collapse = "_"))
+    if (!dir.exists("utils")) dir.create("utils")
+    
+    cle_cache <- paste0(type_voie, "_", paste(round(bbox, 3), collapse = "_"))
     fichier_cache <- paste0("utils/graphe_osm_", cle_cache, ".Rds")
     
-    # 2. Si le fichier existe déjà sur le disque et qu'on ne force pas, on le lit directement
     if (!forcer && file.exists(fichier_cache)) {
-        message("[OSM] Graphe trouvé sur le disque. Chargement instantané...")
+        message("[OSM] Graphe chargé depuis le cache : ", fichier_cache)
         return(readRDS(fichier_cache))
     }
     
-    # 3. Sinon, on procède au téléchargement lourd (une seule fois)
-    message("[OSM] Fichier cache non trouvé. Téléchargement du réseau routier OSM (Dakar)...")
+    message("[OSM] Téléchargement du réseau routier OSM (Dakar)...")
     
-    osm_raw <- osmdata::opq(bbox = bbox) %>%
-        osmdata::add_osm_feature(key = "highway") %>%
-        osmdata::osmdata_sf()
+    bbox_etroit <- c(-17.50, 14.63, -17.32, 14.77)
     
-    message("[OSM] Construction et pondération du graphe dodgr...")
-    graphe <- dodgr::weight_streetnet(
+    osm_raw <- opq(bbox = bbox_etroit) %>%
+        add_osm_feature(key = "highway") %>%
+        osmdata_sf()
+    
+    message("[OSM] Construction du graphe dodgr...")
+    graphe <- weight_streetnet(
         osm_raw,
-        wt_profile = type_voie,
+        wt_profile = "motorcar",
         type_col   = "highway"
     )
     
-    # 4. On sauvegarde le résultat sur le disque pour les prochaines fois
-    message("[OSM] Sauvegarde du graphe sur le disque : ", fichier_cache)
+    # Nettoyer
+    graphe <- graphe %>% filter(!is.na(d) & d > 0 & d < 50000)
+    
     saveRDS(graphe, file = fichier_cache)
+    message("[OSM] Graphe sauvegardé : ", fichier_cache, " (", nrow(graphe), " arêtes)")
     
     graphe
 }
 
-
-
-# ------------------------------------------------------------
-#  snap_candidats_reseau()
-#  Projette les points (centroïdes, dépôt, décharge) sur le
-#  nœud du graphe routier le plus proche.
-#
-#  Arguments :
-#    graphe     : graphe dodgr
-#    coords_ext : data.frame retourné par construire_matrice_distances()
-#                 → coords_etendues (longitude, latitude, index, label)
-#
-#  Retourne : data.frame avec colonnes supplémentaires
-#             snap_lon, snap_lat, node_id (id du nœud dodgr snappé)
-# ------------------------------------------------------------
-
+#' Snap des points sur le réseau routier (version CORRIGÉE)
 snap_candidats_reseau <- function(graphe, coords_ext) {
-    pts_mat <- as.matrix(coords_ext[, c("longitude", "latitude")])
     
-    # dodgr_nearest_vertices : trouve le nœud le plus proche pour chaque point
-    noeuds_snap <- dodgr_nearest_vertices(graphe, pts_mat)
-    
-    # Récupérer les coordonnées des nœuds snappés
+    # Récupérer les sommets du graphe
     verts <- dodgr_vertices(graphe)
     
+    # Extraire les coordonnées des points à snapper
+    pts <- as.matrix(coords_ext[, c("longitude", "latitude")])
+    
+    # Pour chaque point, trouver le nœud le plus proche
+    noeuds_snap <- apply(pts, 1, function(pt) {
+        # Distance euclidienne au carré (plus rapide)
+        dists <- (verts$x - pt[1])^2 + (verts$y - pt[2])^2
+        idx_min <- which.min(dists)
+        verts$id[idx_min]
+    })
+    
+    # Récupérer les coordonnées des nœuds snappés
     snap_info <- verts[match(noeuds_snap, verts$id), c("id", "x", "y")]
     names(snap_info) <- c("node_id", "snap_lon", "snap_lat")
     
-    cbind(coords_ext, snap_info)
+    # Combiner avec les coordonnées originales
+    result <- cbind(coords_ext, snap_info)
+    
+    # Afficher les points snappés pour vérification
+    message("[OSM] Points projetés :")
+    for (i in 1:nrow(result)) {
+        message("  ", result$label[i], " : ",
+                round(result$longitude[i], 5), ",", round(result$latitude[i], 5),
+                " → ",
+                round(result$snap_lon[i], 5), ",", round(result$snap_lat[i], 5))
+    }
+    
+    return(result)
 }
 
-
-# ------------------------------------------------------------
-#  matrice_distances_osm()
-#  Calcule la matrice de distances routières (km) entre tous
-#  les nœuds du graphe étendu via dodgr.
-#
-#  Remplace construire_matrice_distances() (qui utilisait Haversine).
-#  La structure retournée est identique pour compatibilité avec
-#  resoudre_lrp().
-#
-#  Arguments :
-#    candidats    : data.frame des points candidats (lon, lat)
-#    depot_lon/lat, decharge_lon/lat : coordonnées dépôt et décharge
-#    graphe       : graphe dodgr (si NULL, appelle charger_graphe_osm())
-#    bbox         : bbox pour charger_graphe_osm si graphe=NULL
-#
-#  Retourne : même structure que construire_matrice_distances()
-#    + $graphe            : le graphe dodgr (pour réutilisation)
-#    + $coords_snap       : coords snappées sur le réseau
-# ------------------------------------------------------------
-
+#' Matrice de distances ROUTIÈRES OSM (version CORRIGÉE)
 matrice_distances_osm <- function(candidats,
                                   depot_lon, depot_lat,
                                   decharge_lon, decharge_lat,
                                   graphe = NULL,
                                   bbox   = c(-17.55, 14.60, -17.30, 14.80)) {
     
-    # ── Graphe ────────────────────────────────────────────────
     if (is.null(graphe)) {
         graphe <- charger_graphe_osm(bbox = bbox)
     }
     
     n <- nrow(candidats)
     
-    # ── Construire le tableau des nœuds étendus (comme distances.R) ──
+    # Construire les nœuds étendus
     coords_etendues <- data.frame(
         index     = c(1L, seq(2L, n + 1L), n + 2L),
         role      = c("depot", rep("candidat", n), "decharge"),
@@ -188,33 +109,43 @@ matrice_distances_osm <- function(candidats,
         label     = c("Dépôt (O)", paste0("Point_", seq_len(n)), "Décharge (S)")
     )
     
-    # ── Snap sur le réseau routier ────────────────────────────
-    message("[OSM] Projection des points sur le réseau routier...")
+    message("[OSM] 📍 Projection des points sur le réseau routier...")
     coords_snap <- snap_candidats_reseau(graphe, coords_etendues)
     
-    # ── Matrice de distances routières via dodgr ──────────────
-    message("[OSM] Calcul de la matrice de distances routières (", n + 2, " x ", n + 2, ")...")
+    message("[OSM] 🗺️ Calcul de la matrice de distances ROUTIÈRES (", n + 2, " x ", n + 2, ")...")
     
     pts_from <- as.matrix(coords_snap[, c("snap_lon", "snap_lat")])
-    pts_to   <- pts_from   # matrice carrée : tous vers tous
+    pts_to <- pts_from
     
-    # dodgr_dists retourne une matrice en mètres
-    d_metres <- dodgr_dists(graphe, from = pts_from, to = pts_to)
+    # Calculer les distances sur le réseau
+    d_metres <- tryCatch({
+        dodgr_dists(graphe, from = pts_from, to = pts_to)
+    }, error = function(e) {
+        message("[OSM] ⚠️ Erreur dodgr_dists : ", e$message)
+        message("[OSM] 🔄 Fallback vers Haversine")
+        geosphere::distm(pts_from, pts_to, fun = geosphere::distHaversine)
+    })
     
-    # Remplacer NA (nœuds non connexes) par une grande valeur
+    # Remplacer les NA par Haversine (plus réaliste)
     nb_na <- sum(is.na(d_metres))
     if (nb_na > 0) {
-        warning("[OSM] ", nb_na, " paires de nœuds non connexes — remplacées par 9999 km.")
-        d_metres[is.na(d_metres)] <- 9999 * 1000
+        message("[OSM] ⚠️ ", nb_na, " paires de nœuds non connectées")
+        d_metres_hav <- geosphere::distm(pts_from, pts_to, fun = geosphere::distHaversine)
+        d_metres[is.na(d_metres)] <- d_metres_hav[is.na(d_metres)]
     }
     
-    d_matrix <- d_metres / 1000   # → km
+    d_matrix <- d_metres / 1000  # Conversion en km
     diag(d_matrix) <- 0
     
-    message("[OSM] Matrice prête. Distance min : ", round(min(d_matrix[d_matrix > 0]), 2),
-            " km | max : ", round(max(d_matrix), 2), " km")
+    # Afficher un résumé
+    message("[OSM] ✅ Matrice OSM prête.")
+    message("[OSM] Distance min : ", round(min(d_matrix[d_matrix > 0]), 3), " km")
+    message("[OSM] Distance max : ", round(max(d_matrix), 3), " km")
     
-    # ── Retour (même structure que construire_matrice_distances) ──
+    # Afficher la matrice pour vérification
+    message("[OSM] Aperçu de la matrice (km) :")
+    print(round(d_matrix, 2))
+    
     list(
         d_matrix        = d_matrix,
         coords_etendues = coords_etendues,
@@ -227,109 +158,164 @@ matrice_distances_osm <- function(candidats,
     )
 }
 
-
-# ------------------------------------------------------------
-#  geometries_tournees_osm()
-#  Pour chaque arc actif z[v,i,j]=1, calcule le chemin routier
-#  réel et retourne une liste de LINESTRING sf pour Leaflet.
-#
-#  Arguments :
-#    sol_z       : data.frame des arcs actifs (v, i, j) — sol$sol_z
-#    res_dist    : liste retournée par matrice_distances_osm()
-#
-#  Retourne : liste de data.frames avec
-#             v, i, j, geometry (sf LINESTRING), distance_km
-# ------------------------------------------------------------
-
+#' ═══════════════════════════════════════════════════════════════
+#'  Géométries des tournées OSM - VERSION ULTIME ROBUSTE
+#' ═══════════════════════════════════════════════════════════════
 geometries_tournees_osm <- function(sol_z, res_dist) {
     
-    graphe      <- res_dist$graphe
+    graphe <- res_dist$graphe
     coords_snap <- res_dist$coords_snap
     
+    message("[OSM] geometries_tournees_osm appelé")
+    message("[OSM] Nombre d'arcs : ", nrow(sol_z))
+    
+    if (is.null(graphe) || is.null(coords_snap) || nrow(sol_z) == 0) {
+        message("[OSM] ⚠️ Données manquantes")
+        return(NULL)
+    }
+    
     resultats <- list()
+    verts <- dodgr_vertices(graphe)
     
     for (k in seq_len(nrow(sol_z))) {
         v_id <- sol_z$v[k]
-        i    <- sol_z$i[k]
-        j    <- sol_z$j[k]
+        i <- sol_z$i[k]
+        j <- sol_z$j[k]
         
-        # Coordonnées snappées des deux nœuds
-        pt_i <- coords_snap[coords_snap$index == i, c("snap_lon", "snap_lat")]
-        pt_j <- coords_snap[coords_snap$index == j, c("snap_lon", "snap_lat")]
+        # Récupérer les points snappés
+        pt_i <- coords_snap[coords_snap$index == i, ]
+        pt_j <- coords_snap[coords_snap$index == j, ]
         
-        # Chemin réel sur le graphe
-        chemin <- tryCatch(
-            dodgr_paths(graphe,
-                        from = as.matrix(pt_i),
-                        to   = as.matrix(pt_j)),
-            error = function(e) NULL
-        )
+        # Si les points ne sont pas snappés, utiliser les coordonnées originales
+        if (nrow(pt_i) == 0 || is.na(pt_i$snap_lon[1])) {
+            pt_i <- data.frame(
+                index = i,
+                snap_lon = coords_snap$longitude[coords_snap$index == i],
+                snap_lat = coords_snap$latitude[coords_snap$index == i],
+                label = coords_snap$label[coords_snap$index == i]
+            )
+        }
+        if (nrow(pt_j) == 0 || is.na(pt_j$snap_lon[1])) {
+            pt_j <- data.frame(
+                index = j,
+                snap_lon = coords_snap$longitude[coords_snap$index == j],
+                snap_lat = coords_snap$latitude[coords_snap$index == j],
+                label = coords_snap$label[coords_snap$index == j]
+            )
+        }
         
-        if (!is.null(chemin) && length(chemin[[1]][[1]]) > 0) {
-            # Récupérer les coordonnées des nœuds du chemin
-            verts     <- dodgr_vertices(graphe)
-            ids_path  <- chemin[[1]][[1]]
+        from_pts <- as.matrix(pt_i[, c("snap_lon", "snap_lat")])
+        to_pts <- as.matrix(pt_j[, c("snap_lon", "snap_lat")])
+        
+        message("[OSM] Arc ", k, " : véhicule ", v_id, " ", i, " → ", j)
+        message("[OSM]   from : ", paste(round(from_pts, 5), collapse = ", "))
+        message("[OSM]   to   : ", paste(round(to_pts, 5), collapse = ", "))
+        
+        # Essayer plusieurs méthodes pour obtenir le chemin
+        geom <- NULL
+        
+        # Méthode 1 : dodgr_paths direct
+        chemin <- tryCatch({
+            dodgr_paths(graphe, from = from_pts, to = to_pts)
+        }, error = function(e) {
+            NULL
+        })
+        
+        if (!is.null(chemin) && length(chemin[[1]][[1]]) > 1) {
+            ids_path <- chemin[[1]][[1]]
             coords_path <- verts[match(ids_path, verts$id), c("x", "y")]
+            coords_path <- coords_path[!is.na(coords_path$x), ]
             
-            # Construire LINESTRING sf
-            geom <- st_linestring(as.matrix(coords_path))
-        } else {
-            # Fallback : ligne droite si le chemin échoue
+            if (nrow(coords_path) > 1) {
+                geom <- st_linestring(as.matrix(coords_path))
+                message("[OSM] ✅ Chemin trouvé (", nrow(coords_path), " points)")
+            }
+        }
+        
+        # Méthode 2 : Si échec, essayer de trouver un chemin entre les nœuds les plus proches
+        if (is.null(geom)) {
+            message("[OSM] 🔄 Tentative avec les nœuds les plus proches")
+            
+            # Trouver les nœuds les plus proches des points
+            idx_from <- which.min((verts$x - from_pts[1])^2 + (verts$y - from_pts[2])^2)
+            idx_to <- which.min((verts$x - to_pts[1])^2 + (verts$y - to_pts[2])^2)
+            
+            from_pts2 <- as.matrix(verts[idx_from, c("x", "y")])
+            to_pts2 <- as.matrix(verts[idx_to, c("x", "y")])
+            
+            chemin2 <- tryCatch({
+                dodgr_paths(graphe, from = from_pts2, to = to_pts2)
+            }, error = function(e) {
+                NULL
+            })
+            
+            if (!is.null(chemin2) && length(chemin2[[1]][[1]]) > 1) {
+                ids_path <- chemin2[[1]][[1]]
+                coords_path <- verts[match(ids_path, verts$id), c("x", "y")]
+                coords_path <- coords_path[!is.na(coords_path$x), ]
+                
+                if (nrow(coords_path) > 1) {
+                    geom <- st_linestring(as.matrix(coords_path))
+                    message("[OSM] ✅ Chemin trouvé avec nœuds les plus proches (", nrow(coords_path), " points)")
+                }
+            }
+        }
+        
+        # Fallback final : ligne droite
+        if (is.null(geom)) {
             geom <- st_linestring(matrix(
-                c(pt_i$snap_lon, pt_i$snap_lat,
-                  pt_j$snap_lon, pt_j$snap_lat),
+                c(pt_i$snap_lon[1], pt_i$snap_lat[1],
+                  pt_j$snap_lon[1], pt_j$snap_lat[1]),
                 ncol = 2, byrow = TRUE
             ))
+            message("[OSM] 📏 Fallback : ligne droite")
         }
         
         resultats[[k]] <- list(
-            v           = v_id,
-            i           = i,
-            j           = j,
-            label_i     = coords_snap$label[coords_snap$index == i],
-            label_j     = coords_snap$label[coords_snap$index == j],
+            v = v_id,
+            i = i,
+            j = j,
+            label_i = pt_i$label[1],
+            label_j = pt_j$label[1],
             distance_km = round(res_dist$d_matrix[i, j], 3),
-            geometry    = geom
+            geometry = geom
         )
     }
     
-    resultats
+    message("[OSM] geometries_tournees_osm terminé : ", length(resultats), " géométries")
+    return(resultats)
 }
 
-
-# ------------------------------------------------------------
-#  tracer_tournees_osm()
-#  Ajoute les itinéraires OSM sur une carte Leaflet existante.
-#  Remplace la boucle addPolylines dans server.R.
-#
-#  Arguments :
-#    m           : objet leaflet existant
-#    geometries  : liste retournée par geometries_tournees_osm()
-#    couleurs    : vecteur de couleurs (une par véhicule)
-#
-#  Retourne : objet leaflet enrichi
-# ------------------------------------------------------------
-
+#' Tracer les tournées OSM sur une carte Leaflet
 tracer_tournees_osm <- function(m, geometries, couleurs) {
     
     COLORS <- c("#378ADD", "#D85A30", "#1D9E75", "#7F77DD", "#BA7517",
                 "#E41A1C", "#FF7F00", "#4DAF4A", "#984EA3", "#A65628")
     
     for (geo in geometries) {
-        v_id    <- geo$v
-        couleur <- COLORS[(v_id - 1) %% length(COLORS) + 1]
-        coords  <- st_coordinates(geo$geometry)
+        if (is.null(geo)) next
         
-        m <- m %>% addPolylines(
-            lng     = coords[, 1],
-            lat     = coords[, 2],
-            color   = couleur,
-            weight  = 3,
-            opacity = 0.85,
-            label   = paste0("Véhicule ", v_id, " : ",
-                             geo$label_i, " → ", geo$label_j,
-                             " (", geo$distance_km, " km)")
-        )
+        v_id <- geo$v
+        couleur <- COLORS[(v_id - 1) %% length(COLORS) + 1]
+        
+        tryCatch({
+            coords <- st_coordinates(geo$geometry)
+            
+            if (nrow(coords) > 1) {
+                m <- m %>% addPolylines(
+                    lng = coords[, 1],
+                    lat = coords[, 2],
+                    color = couleur,
+                    weight = 4,
+                    opacity = 0.9,
+                    label = paste0("Véhicule ", v_id, " : ",
+                                   geo$label_i, " → ", geo$label_j,
+                                   " (", geo$distance_km, " km)")
+                )
+            }
+        }, error = function(e) {
+            message("[OSM] ⚠️ Erreur tracé : ", e$message)
+        })
     }
     m
 }

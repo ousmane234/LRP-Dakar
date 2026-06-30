@@ -3,27 +3,7 @@
 #  Auteur : Ousmane LO
 #
 #  Point d'entrée unique. Lance l'application avec :
-#    shiny::runApp(".")            # depuis le dossier du projet
-#    shiny::runApp("dakar_lrp/")  # depuis le dossier parent
-#
-#  Structure du projet :
-#    app.R
-#    ui.R
-#    server.R
-#    modules/
-#      clustering.R     K-means contraint + détection du coude
-#      distances.R      Matrice étendue dépôt + candidats + décharge
-#      modele_mip.R     Formulation et résolution LRP (ompr)
-#    utils/
-#      osm_routing.R    Routage routier réel via dodgr + OSM
-#
-#  Packages requis (installer une seule fois) :
-#    install.packages(c(
-#      "shiny", "shinydashboard", "leaflet", "DT",
-#      "ggplot2", "dplyr", "geosphere",
-#      "ompr", "ompr.roi", "ROI.plugin.glpk",
-#      "dodgr", "osmdata", "sf"
-#    ))
+#    shiny::runApp(".")
 # ============================================================
 
 # ── Packages ────────────────────────────────────────────────
@@ -34,6 +14,7 @@ library(DT)
 library(ggplot2)
 library(dplyr)
 library(geosphere)
+library(digest)
 library(ompr)
 library(ompr.roi)
 library(ROI.plugin.glpk)
@@ -41,11 +22,12 @@ library(dodgr)
 library(osmdata)
 library(sf)
 
-# ── Chargement des modules métier ───────────────────────────
-source("modules/distances.R")
-source("modules/modele_mip.R")
+# ── Chargement des modules ─────────────────────────────────
 source("modules/clustering.R")
+source("modules/distances.R")
 source("utils/osm_routing.R")
+source("modules/cache_graphe.R")      # NOUVEAU
+source("modules/modele_mip.R")
 source("modules/resultats.R")
 
 # ── UI et Server ────────────────────────────────────────────
