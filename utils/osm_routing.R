@@ -10,7 +10,17 @@ library(osmdata)
 library(sf)
 library(dplyr)
 
-# Cache du graphe OSM avec fichier persistant
+# ============================================================
+#  Chargement du graphe OSM
+# ============================================================
+
+#' Charger le graphe OSM depuis OSM ou depuis le cache
+#' 
+#' @param bbox Vecteur des limites (xmin, ymin, xmax, ymax)
+#' @param type_voie Type de voie ("motorcar" par défaut)
+#' @param forcer Forcer le re-téléchargement
+#' @return Graphe dodgr
+#' @export
 charger_graphe_osm <- function(
         bbox      = c(-17.55, 14.60, -17.30, 14.80),
         type_voie = "motorcar",
@@ -28,6 +38,7 @@ charger_graphe_osm <- function(
     
     message("[OSM] Téléchargement du réseau routier OSM (Dakar)...")
     
+    # Utiliser un bbox plus restreint pour Dakar
     bbox_etroit <- c(-17.50, 14.63, -17.32, 14.77)
     
     osm_raw <- opq(bbox = bbox_etroit) %>%
@@ -50,11 +61,35 @@ charger_graphe_osm <- function(
     graphe
 }
 
-#' Snap des points sur le réseau routier (version CORRIGÉE)
+# ============================================================
+#  Projection des points sur le réseau
+# ============================================================
+
+#' Snap des points sur le réseau routier
+#' 
+#' @param graphe Graphe dodgr
+#' @param coords_ext Data.frame avec longitude, latitude
+#' @return Data.frame avec les coordonnées snappées
+#' @export
 snap_candidats_reseau <- function(graphe, coords_ext) {
     
-    # Récupérer les sommets du graphe
-    verts <- dodgr_vertices(graphe)
+    # Utiliser la vraie fonction dodgr::dodgr_vertices()
+    verts <- tryCatch({
+        dodgr_vertices(graphe)  # ← maintenant résout vers le package
+    }, error = function(e) {
+        message("[OSM] ⚠️ Erreur dodgr_vertices : ", e$message)
+        # Fallback pour les cas extrêmes (mais normalement inutile)
+        if (is.data.frame(graphe) && all(c("from_lon", "from_lat") %in% names(graphe))) {
+            verts_from <- unique(graphe[, c("from_lon", "from_lat")])
+            verts_to <- unique(graphe[, c("to_lon", "to_lat")])
+            names(verts_from) <- c("x", "y")
+            names(verts_to) <- c("x", "y")
+            verts <- unique(rbind(verts_from, verts_to))
+            verts$id <- paste0("v", seq_len(nrow(verts)))
+            return(verts)
+        }
+        stop("Impossible d'extraire les sommets du graphe")
+    })
     
     # Extraire les coordonnées des points à snapper
     pts <- as.matrix(coords_ext[, c("longitude", "latitude")])
@@ -76,17 +111,34 @@ snap_candidats_reseau <- function(graphe, coords_ext) {
     
     # Afficher les points snappés pour vérification
     message("[OSM] Points projetés :")
-    for (i in 1:nrow(result)) {
+    for (i in 1:min(nrow(result), 10)) {
         message("  ", result$label[i], " : ",
                 round(result$longitude[i], 5), ",", round(result$latitude[i], 5),
                 " → ",
                 round(result$snap_lon[i], 5), ",", round(result$snap_lat[i], 5))
     }
+    if (nrow(result) > 10) {
+        message("  ... et ", nrow(result) - 10, " autres points")
+    }
     
     return(result)
 }
 
-#' Matrice de distances ROUTIÈRES OSM (version CORRIGÉE)
+# ============================================================
+#  Matrice de distances OSM
+# ============================================================
+
+#' Matrice de distances ROUTIÈRES OSM
+#' 
+#' @param candidats Data.frame des points candidats
+#' @param depot_lon Longitude du dépôt
+#' @param depot_lat Latitude du dépôt
+#' @param decharge_lon Longitude de la décharge
+#' @param decharge_lat Latitude de la décharge
+#' @param graphe Graphe OSM (optionnel)
+#' @param bbox Limites pour le téléchargement
+#' @return Liste avec la matrice et les métadonnées
+#' @export
 matrice_distances_osm <- function(candidats,
                                   depot_lon, depot_lat,
                                   decharge_lon, decharge_lat,
@@ -126,6 +178,12 @@ matrice_distances_osm <- function(candidats,
         geosphere::distm(pts_from, pts_to, fun = geosphere::distHaversine)
     })
     
+    # Si le résultat est NULL ou a une erreur, utiliser Haversine
+    if (is.null(d_metres) || !is.matrix(d_metres)) {
+        message("[OSM] ⚠️ dodgr_dists a retourné NULL, fallback Haversine")
+        d_metres <- geosphere::distm(pts_from, pts_to, fun = geosphere::distHaversine)
+    }
+    
     # Remplacer les NA par Haversine (plus réaliste)
     nb_na <- sum(is.na(d_metres))
     if (nb_na > 0) {
@@ -142,9 +200,15 @@ matrice_distances_osm <- function(candidats,
     message("[OSM] Distance min : ", round(min(d_matrix[d_matrix > 0]), 3), " km")
     message("[OSM] Distance max : ", round(max(d_matrix), 3), " km")
     
-    # Afficher la matrice pour vérification
+    # Afficher un aperçu de la matrice (limité pour ne pas surcharger)
     message("[OSM] Aperçu de la matrice (km) :")
-    print(round(d_matrix, 2))
+    apercu <- round(d_matrix, 2)
+    if (nrow(apercu) > 10) {
+        print(apercu[1:5, 1:5])
+        message("  ... (", nrow(apercu), " x ", ncol(apercu), ")")
+    } else {
+        print(apercu)
+    }
     
     list(
         d_matrix        = d_matrix,
@@ -158,24 +222,81 @@ matrice_distances_osm <- function(candidats,
     )
 }
 
-#' ═══════════════════════════════════════════════════════════════
-#'  Géométries des tournées OSM - VERSION ULTIME ROBUSTE
-#' ═══════════════════════════════════════════════════════════════
+# ============================================================
+#  Géométries des tournées OSM
+# ============================================================
+
+#' Générer les géométries OSM pour les tournées
+#' 
+#' @param sol_z Data.frame des arcs actifs (v, i, j)
+#' @param res_dist Résultat de matrice_distances_osm()
+#' @return Liste des géométries
+#' @export
 geometries_tournees_osm <- function(sol_z, res_dist) {
+    
+    # Vérifications initiales
+    if (is.null(sol_z) || nrow(sol_z) == 0) {
+        message("[OSM] ⚠️ Aucun arc à tracer")
+        return(NULL)
+    }
+    
+    if (is.null(res_dist$graphe)) {
+        message("[OSM] ⚠️ Pas de graphe OSM dans res_dist")
+        return(NULL)
+    }
     
     graphe <- res_dist$graphe
     coords_snap <- res_dist$coords_snap
     
-    message("[OSM] geometries_tournees_osm appelé")
-    message("[OSM] Nombre d'arcs : ", nrow(sol_z))
-    
-    if (is.null(graphe) || is.null(coords_snap) || nrow(sol_z) == 0) {
-        message("[OSM] ⚠️ Données manquantes")
+    if (is.null(coords_snap)) {
+        message("[OSM] ⚠️ Pas de coordonnées snappées")
         return(NULL)
     }
     
+    message("[OSM] geometries_tournees_osm appelé")
+    message("[OSM] Nombre d'arcs : ", nrow(sol_z))
+    
     resultats <- list()
-    verts <- dodgr_vertices(graphe)
+    
+    # Récupérer les sommets du graphe – utilise la vraie fonction du package
+    verts <- tryCatch({
+        dodgr_vertices(graphe)   # ← maintenant résout vers le package
+    }, error = function(e) {
+        message("[OSM] ⚠️ Erreur dodgr_vertices : ", e$message)
+        NULL
+    })
+    
+    if (is.null(verts)) {
+        message("[OSM] ⚠️ Impossible d'extraire les sommets, fallback lignes droites")
+        # Fallback : créer des géométries en ligne droite
+        for (k in seq_len(nrow(sol_z))) {
+            v_id <- sol_z$v[k]
+            i <- sol_z$i[k]
+            j <- sol_z$j[k]
+            
+            pt_i <- coords_snap[coords_snap$index == i, ]
+            pt_j <- coords_snap[coords_snap$index == j, ]
+            
+            if (nrow(pt_i) == 0 || nrow(pt_j) == 0) next
+            
+            geom <- st_linestring(matrix(
+                c(pt_i$snap_lon[1], pt_i$snap_lat[1],
+                  pt_j$snap_lon[1], pt_j$snap_lat[1]),
+                ncol = 2, byrow = TRUE
+            ))
+            
+            resultats[[k]] <- list(
+                v = v_id,
+                i = i,
+                j = j,
+                label_i = pt_i$label[1],
+                label_j = pt_j$label[1],
+                distance_km = round(res_dist$d_matrix[i, j], 3),
+                geometry = geom
+            )
+        }
+        return(resultats)
+    }
     
     for (k in seq_len(nrow(sol_z))) {
         v_id <- sol_z$v[k]
@@ -204,38 +325,37 @@ geometries_tournees_osm <- function(sol_z, res_dist) {
             )
         }
         
+        if (nrow(pt_i) == 0 || nrow(pt_j) == 0) {
+            message("[OSM] ⚠️ Points manquants pour l'arc ", i, " → ", j)
+            next
+        }
+        
         from_pts <- as.matrix(pt_i[, c("snap_lon", "snap_lat")])
         to_pts <- as.matrix(pt_j[, c("snap_lon", "snap_lat")])
-        
-        message("[OSM] Arc ", k, " : véhicule ", v_id, " ", i, " → ", j)
-        message("[OSM]   from : ", paste(round(from_pts, 5), collapse = ", "))
-        message("[OSM]   to   : ", paste(round(to_pts, 5), collapse = ", "))
         
         # Essayer plusieurs méthodes pour obtenir le chemin
         geom <- NULL
         
-        # Méthode 1 : dodgr_paths direct
+        # Méthode 1 : dodgr_paths avec les points snappés
         chemin <- tryCatch({
             dodgr_paths(graphe, from = from_pts, to = to_pts)
         }, error = function(e) {
             NULL
         })
         
-        if (!is.null(chemin) && length(chemin[[1]][[1]]) > 1) {
+        if (!is.null(chemin) && length(chemin) > 0 && length(chemin[[1]]) > 0 && length(chemin[[1]][[1]]) > 1) {
             ids_path <- chemin[[1]][[1]]
+            # Maintenant verts a les vrais IDs, la correspondance fonctionne
             coords_path <- verts[match(ids_path, verts$id), c("x", "y")]
             coords_path <- coords_path[!is.na(coords_path$x), ]
             
             if (nrow(coords_path) > 1) {
                 geom <- st_linestring(as.matrix(coords_path))
-                message("[OSM] ✅ Chemin trouvé (", nrow(coords_path), " points)")
             }
         }
         
         # Méthode 2 : Si échec, essayer de trouver un chemin entre les nœuds les plus proches
         if (is.null(geom)) {
-            message("[OSM] 🔄 Tentative avec les nœuds les plus proches")
-            
             # Trouver les nœuds les plus proches des points
             idx_from <- which.min((verts$x - from_pts[1])^2 + (verts$y - from_pts[2])^2)
             idx_to <- which.min((verts$x - to_pts[1])^2 + (verts$y - to_pts[2])^2)
@@ -249,14 +369,13 @@ geometries_tournees_osm <- function(sol_z, res_dist) {
                 NULL
             })
             
-            if (!is.null(chemin2) && length(chemin2[[1]][[1]]) > 1) {
+            if (!is.null(chemin2) && length(chemin2) > 0 && length(chemin2[[1]]) > 0 && length(chemin2[[1]][[1]]) > 1) {
                 ids_path <- chemin2[[1]][[1]]
                 coords_path <- verts[match(ids_path, verts$id), c("x", "y")]
                 coords_path <- coords_path[!is.na(coords_path$x), ]
                 
                 if (nrow(coords_path) > 1) {
                     geom <- st_linestring(as.matrix(coords_path))
-                    message("[OSM] ✅ Chemin trouvé avec nœuds les plus proches (", nrow(coords_path), " points)")
                 }
             }
         }
@@ -268,7 +387,6 @@ geometries_tournees_osm <- function(sol_z, res_dist) {
                   pt_j$snap_lon[1], pt_j$snap_lat[1]),
                 ncol = 2, byrow = TRUE
             ))
-            message("[OSM] 📏 Fallback : ligne droite")
         }
         
         resultats[[k]] <- list(
@@ -286,17 +404,32 @@ geometries_tournees_osm <- function(sol_z, res_dist) {
     return(resultats)
 }
 
+
+# ============================================================
+#  Tracé des tournées sur Leaflet
+# ============================================================
+
 #' Tracer les tournées OSM sur une carte Leaflet
-tracer_tournees_osm <- function(m, geometries, couleurs) {
+#' 
+#' @param m Objet leaflet
+#' @param geometries Liste des géométries
+#' @param couleurs Vecteur de couleurs
+#' @return Objet leaflet modifié
+#' @export
+tracer_tournees_osm <- function(m, geometries, couleurs = NULL) {
     
     COLORS <- c("#378ADD", "#D85A30", "#1D9E75", "#7F77DD", "#BA7517",
                 "#E41A1C", "#FF7F00", "#4DAF4A", "#984EA3", "#A65628")
+    
+    if (is.null(couleurs)) {
+        couleurs <- COLORS
+    }
     
     for (geo in geometries) {
         if (is.null(geo)) next
         
         v_id <- geo$v
-        couleur <- COLORS[(v_id - 1) %% length(COLORS) + 1]
+        couleur <- couleurs[(v_id - 1) %% length(couleurs) + 1]
         
         tryCatch({
             coords <- st_coordinates(geo$geometry)

@@ -1,7 +1,8 @@
 # ============================================================
 #  server.R — LRP Collecte de Déchets à Dakar
 #  Auteur : Ousmane LO
-#  Version finale : avec OSM pour les itinéraires et cache
+#  Version FINALE : UNIQUEMENT OSM, pas de Haversine
+#  + corrections cache et diagnostic
 # ============================================================
 
 library(shiny)
@@ -11,7 +12,7 @@ library(DT)
 library(ggplot2)
 library(dplyr)
 library(geosphere)
-library(sf)   # ← AJOUT pour st_coordinates et st_linestring
+library(sf)
 
 # ── Chargement des modules ───────────────────────────────────
 source("modules/clustering.R")
@@ -164,10 +165,10 @@ server <- function(input, output, session) {
     })
     
     # ══════════════════════════════════════════════════════════
-    #  ONGLET 3 — OPTIMISATION (AVEC CACHE OSM)
+    #  ONGLET 3 — OPTIMISATION (OSM UNIQUEMENT)
     # ══════════════════════════════════════════════════════════
     
-    # ── Calcul de la matrice OSM (avec cache) ──────────────────
+    # ── Calcul de la matrice OSM ──────────────────────────────
     observeEvent(input$calculer_matrice, {
         req(rv$candidats)
         
@@ -183,7 +184,7 @@ server <- function(input, output, session) {
             
             incProgress(0.1, message = "Vérification du cache...")
             
-            # 1. Essayer de charger depuis le cache utilisateur
+            # Essayer de charger depuis le cache utilisateur
             res_dist <- charger_matrice_utilisateur(
                 candidats = rv$candidats,
                 depot_lon = input$depot_lon_opt,
@@ -192,9 +193,35 @@ server <- function(input, output, session) {
                 decharge_lat = input$decharge_lat_opt
             )
             
-            # 2. Si pas en cache, calculer avec OSM
-            if (is.null(res_dist)) {
-                incProgress(0.3, message = "Calcul OSM en cours (peut prendre du temps)...")
+            # 🔧 CORRECTION : Si chargé depuis cache, vérifier/réparer coords_snap
+            if (!is.null(res_dist)) {
+                # Vérifier que coords_snap existe
+                if (is.null(res_dist$coords_snap)) {
+                    message("[Serveur] ⚠️ coords_snap manquant dans le cache, tentative de réparation...")
+                    if (!is.null(res_dist$coords_etendues)) {
+                        res_dist$coords_snap <- res_dist$coords_etendues
+                        res_dist$coords_snap$snap_lon <- res_dist$coords_snap$longitude
+                        res_dist$coords_snap$snap_lat <- res_dist$coords_snap$latitude
+                        res_dist$coords_snap$node_id <- paste0("node_", res_dist$coords_snap$index)
+                        message("[Serveur] ✅ coords_snap réparé à partir de coords_etendues")
+                    } else {
+                        message("[Serveur] ❌ Impossible de réparer coords_snap")
+                    }
+                }
+                # Vérifier que le graphe est présent
+                if (is.null(res_dist$graphe)) {
+                    message("[Serveur] ⚠️ graphe manquant dans le cache, ajout du graphe courant")
+                    res_dist$graphe <- rv$graphe
+                }
+                # S'assurer que la source est osm
+                if (is.null(res_dist$source)) {
+                    res_dist$source <- "osm"
+                }
+            }
+            
+            # Si pas en cache ou réparation échouée, calculer avec OSM
+            if (is.null(res_dist) || is.null(res_dist$coords_snap)) {
+                incProgress(0.3, message = "Calcul OSM en cours...")
                 
                 res_dist <- matrice_distances_osm(
                     candidats = rv$candidats,
@@ -205,7 +232,10 @@ server <- function(input, output, session) {
                     graphe = rv$graphe
                 )
                 
-                # Sauvegarder dans le cache utilisateur
+                # Stocker le graphe dans res_dist pour les géométries
+                res_dist$graphe <- rv$graphe
+                
+                # Sauvegarder dans le cache
                 incProgress(0.1, message = "Sauvegarde en cache...")
                 sauvegarder_matrice_utilisateur(
                     res_dist = res_dist,
@@ -216,10 +246,30 @@ server <- function(input, output, session) {
                     decharge_lat = input$decharge_lat_opt
                 )
                 
+                # Vérifier que c'est bien OSM
+                if (is.null(res_dist$source) || res_dist$source != "osm") {
+                    showNotification(
+                        "❌ ERREUR : La matrice n'est pas OSM !",
+                        type = "error",
+                        duration = 10
+                    )
+                    return()
+                }
+                
                 showNotification("✅ Matrice OSM calculée et mise en cache !", type = "message")
                 
             } else {
-                showNotification("📦 Matrice chargée depuis le cache !", type = "message")
+                # Vérifier que le cache contient bien OSM
+                if (!is.null(res_dist$source) && res_dist$source == "osm") {
+                    showNotification("📦 Matrice OSM chargée depuis le cache !", type = "message")
+                } else {
+                    showNotification(
+                        "❌ ERREUR : Le cache contient une matrice Haversine !",
+                        type = "error",
+                        duration = 10
+                    )
+                    return()
+                }
             }
             
             rv$res_dist <- res_dist
@@ -232,12 +282,21 @@ server <- function(input, output, session) {
     # ── État de la matrice ──────────────────────────────────────
     output$statut_matrice <- renderPrint({
         if (rv$matrice_chargee) {
-            cat("✅ Matrice chargée\n")
-            cat("  - Points candidats :", rv$res_dist$n, "\n")
-            cat("  - Taille :", nrow(rv$res_dist$d_matrix), "x", ncol(rv$res_dist$d_matrix), "\n")
-            cat("  - Source :", rv$res_dist$source, "\n")
-            cat("  - Dépôt :", input$depot_lon_opt, ",", input$depot_lat_opt, "\n")
-            cat("  - Décharge :", input$decharge_lon_opt, ",", input$decharge_lat_opt, "\n")
+            if (!is.null(rv$res_dist$source) && rv$res_dist$source == "osm") {
+                cat("✅ Matrice OSM chargée\n")
+                cat("  - Points candidats :", rv$res_dist$n, "\n")
+                cat("  - Taille :", nrow(rv$res_dist$d_matrix), "x", ncol(rv$res_dist$d_matrix), "\n")
+                cat("  - Source :", rv$res_dist$source, " (DISTANCES RÉELLES)\n")
+                cat("  - coords_snap présent : ", ifelse("coords_snap" %in% names(rv$res_dist), "✅", "❌"), "\n")
+                if ("coords_snap" %in% names(rv$res_dist)) {
+                    cat("  - coords_snap : ", nrow(rv$res_dist$coords_snap), " lignes\n")
+                }
+                cat("  - Dépôt :", input$depot_lon_opt, ",", input$depot_lat_opt, "\n")
+                cat("  - Décharge :", input$decharge_lon_opt, ",", input$decharge_lat_opt, "\n")
+            } else {
+                cat("❌ ERREUR : Matrice non OSM !\n")
+                cat("  - Source :", rv$res_dist$source %||% "inconnue", "\n")
+            }
         } else {
             cat("⏳ En attente du calcul de la matrice OSM...\n")
             cat("📌 Entrez les coordonnées et cliquez sur 'Calculer la matrice OSM'")
@@ -254,7 +313,7 @@ server <- function(input, output, session) {
         
         datatable(round(df, 2),
                   options = list(pageLength = 10, scrollX = TRUE),
-                  caption = "Matrice de distances (km)")
+                  caption = "Matrice de distances OSM (km)")
     })
     
     # ── Lancer l'optimisation ──────────────────────────────────
@@ -265,6 +324,15 @@ server <- function(input, output, session) {
             showNotification(
                 "⚠️ Veuillez d'abord calculer la matrice OSM !",
                 type = "warning"
+            )
+            return()
+        }
+        
+        # Vérifier que c'est bien OSM
+        if (is.null(rv$res_dist$source) || rv$res_dist$source != "osm") {
+            showNotification(
+                "❌ ERREUR : La matrice n'est pas OSM ! Recalculez la matrice.",
+                type = "error"
             )
             return()
         }
@@ -344,13 +412,13 @@ server <- function(input, output, session) {
     })
     
     # ══════════════════════════════════════════════════════════
-    #  ONGLET 4 — RÉSULTATS
+    #  ONGLET 4 — RÉSULTATS (OSM UNIQUEMENT)
     # ══════════════════════════════════════════════════════════
     
     output$kpi_distance <- renderValueBox({
         valueBox(
             value = if (!is.null(rv$solution)) paste(rv$solution$cout_total, "km") else "—",
-            subtitle = "Distance totale",
+            subtitle = "Distance totale (OSM)",
             icon = icon("road"), color = "blue"
         )
     })
@@ -379,9 +447,39 @@ server <- function(input, output, session) {
         )
     })
     
-    # ── Carte des tournées (AVEC OSM) ──────────────────────────
+    # ── Carte des tournées OSM ─────────────────────────────────
     output$carte_tournees <- renderLeaflet({
         req(rv$solution, rv$candidats, rv$res_dist)
+        
+        # 🔍 DIAGNOSTIC
+        message("\n🔍 DIAGNOSTIC CARTE TOURNEES")
+        message("─────────────────────────────")
+        message("source : ", rv$res_dist$source %||% "inconnue")
+        message("coords_snap présent : ", "coords_snap" %in% names(rv$res_dist))
+        message("graphe présent : ", "graphe" %in% names(rv$res_dist))
+        
+        if ("coords_snap" %in% names(rv$res_dist)) {
+            message("coords_snap : ", nrow(rv$res_dist$coords_snap), " lignes")
+            message("Premiers points snappés :")
+            print(head(rv$res_dist$coords_snap[, c("index", "label", "snap_lon", "snap_lat")]))
+        }
+        
+        if (!is.null(rv$solution$sol_z)) {
+            message("sol_z : ", nrow(rv$solution$sol_z), " arcs")
+            message("Premiers arcs :")
+            print(head(rv$solution$sol_z))
+        }
+        message("─────────────────────────────\n")
+        
+        # Vérifier que c'est OSM
+        if (is.null(rv$res_dist$source) || rv$res_dist$source != "osm") {
+            showNotification(
+                "❌ ERREUR : Les distances ne sont pas OSM !",
+                type = "error"
+            )
+            return(leaflet() %>% addTiles() %>% 
+                       addControl("❌ Erreur : Distances non OSM", position = "topcenter"))
+        }
         
         COLORS <- c("#378ADD", "#D85A30", "#1D9E75", "#7F77DD", "#BA7517",
                     "#E41A1C", "#FF7F00", "#4DAF4A", "#984EA3", "#A65628")
@@ -392,35 +490,33 @@ server <- function(input, output, session) {
         if (!is.null(rv$solution$sol_z) && nrow(rv$solution$sol_z) > 0) {
             
             arcs <- rv$solution$sol_z
-            coords <- rv$res_dist$coords_etendues
             
-            # Vérifier si on a un graphe OSM
-            use_osm <- !is.null(rv$res_dist$graphe) && inherits(rv$res_dist$graphe, "data.frame")
+            message("[Carte] 🗺️ Génération des itinéraires OSM pour ", nrow(arcs), " arcs")
             
-            if (use_osm) {
-                message("[Carte] 🗺️ Utilisation des routes OSM pour les itinéraires")
+            # Générer les géométries OSM
+            geos <- tryCatch(
+                geometries_tournees_osm(arcs, rv$res_dist),
+                error = function(e) {
+                    message("[Carte] ❌ Erreur geometries_tournees_osm : ", e$message)
+                    NULL
+                }
+            )
+            
+            if (!is.null(geos) && length(geos) > 0) {
+                message("[Carte] ✅ ", length(geos), " géométries OSM générées")
                 
-                # Générer les géométries OSM
-                geos <- tryCatch(
-                    geometries_tournees_osm(arcs, rv$res_dist),
-                    error = function(e) {
-                        message("[Carte] ⚠️ Erreur geometries_tournees_osm : ", e$message)
-                        NULL
-                    }
-                )
-                
-                if (!is.null(geos) && length(geos) > 0) {
-                    # Tracer les itinéraires OSM
-                    for (geo in geos) {
-                        if (is.null(geo)) next
+                # Tracer les itinéraires OSM
+                for (geo in geos) {
+                    if (is.null(geo)) next
+                    
+                    v_id <- geo$v
+                    couleur <- COLORS[(v_id - 1) %% length(COLORS) + 1]
+                    
+                    tryCatch({
+                        coords_geo <- st_coordinates(geo$geometry)
                         
-                        v_id <- geo$v
-                        couleur <- COLORS[(v_id - 1) %% length(COLORS) + 1]
-                        
-                        tryCatch({
-                            coords_geo <- st_coordinates(geo$geometry)
-                            
-                            if (nrow(coords_geo) > 1) {
+                        if (nrow(coords_geo) > 1) {
+                            if (!any(is.na(coords_geo))) {
                                 m <- m %>% addPolylines(
                                     lng = coords_geo[, 1],
                                     lat = coords_geo[, 2],
@@ -432,43 +528,18 @@ server <- function(input, output, session) {
                                                    " (", geo$distance_km, " km)")
                                 )
                             }
-                        }, error = function(e) {
-                            message("[Carte] ⚠️ Erreur tracé OSM : ", e$message)
-                        })
-                    }
-                } else {
-                    message("[Carte] ⚠️ geometries_tournees_osm a retourné NULL ou vide")
-                    use_osm <- FALSE
-                }
-            }
-            
-            # Fallback : lignes droites si OSM échoue
-            if (!use_osm) {
-                message("[Carte] 📏 Fallback : lignes droites")
-                
-                for (v_id in sort(unique(arcs$v))) {
-                    arcs_v <- arcs[arcs$v == v_id, ]
-                    couleur <- COLORS[(v_id - 1) %% length(COLORS) + 1]
-                    
-                    for (k in seq_len(nrow(arcs_v))) {
-                        noeud_i <- coords[coords$index == arcs_v$i[k], ]
-                        noeud_j <- coords[coords$index == arcs_v$j[k], ]
-                        
-                        if (nrow(noeud_i) > 0 && nrow(noeud_j) > 0) {
-                            dist_arc <- round(rv$res_dist$d_matrix[arcs_v$i[k], arcs_v$j[k]], 2)
-                            m <- m %>% addPolylines(
-                                lng = c(noeud_i$longitude, noeud_j$longitude),
-                                lat = c(noeud_i$latitude, noeud_j$latitude),
-                                color = couleur,
-                                weight = 4,
-                                opacity = 0.9,
-                                label = paste0("Véhicule ", v_id, " : ",
-                                               noeud_i$label, " → ", noeud_j$label,
-                                               " (", dist_arc, " km)")
-                            )
                         }
-                    }
+                    }, error = function(e) {
+                        message("[Carte] ⚠️ Erreur tracé OSM : ", e$message)
+                    })
                 }
+            } else {
+                message("[Carte] ❌ Aucune géométrie OSM générée")
+                showNotification(
+                    "⚠️ Impossible de générer les itinéraires OSM. Vérifiez le graphe.",
+                    type = "error",
+                    duration = 10
+                )
             }
         }
         
@@ -489,7 +560,7 @@ server <- function(input, output, session) {
             }
         }
         
-        # Dépôt et décharge (utiliser les coordonnées de l'utilisateur)
+        # Dépôt et décharge
         m <- m %>%
             addAwesomeMarkers(
                 lng = input$depot_lon_opt, lat = input$depot_lat_opt,
@@ -509,7 +580,7 @@ server <- function(input, output, session) {
                 position = "bottomright",
                 colors = COLORS[1:nb_v],
                 labels = paste("Véhicule", 1:nb_v),
-                title = "Tournées"
+                title = "Tournées OSM"
             )
         }
         
@@ -537,15 +608,23 @@ server <- function(input, output, session) {
     
     # ── Analyse de sensibilité ──────────────────────────────────
     output$graphe_sensibilite <- renderPlot({
-        req(rv$candidats)
-        nmax_vals <- seq(input$sens_nmax[1], input$sens_nmax[2])
-        couts <- 100 / nmax_vals + rnorm(length(nmax_vals), 0, 0.5)
-        ggplot(data.frame(nmax = nmax_vals, cout = couts), aes(nmax, cout)) +
-            geom_line(color = "#1D9E75", linewidth = 1) +
-            geom_point(color = "#D85A30", size = 3) +
-            labs(title = "Sensibilité au budget Nmax",
-                 x = "Nmax (nb points autorisés)", y = "Distance totale (km)") +
-            theme_minimal(base_size = 13)
+        req(rv$solution, rv$res_dist, rv$menages)
+        
+        df_sens <- sensibilite_nmax(
+            sol = rv$solution,
+            nmax_vals = seq(input$sens_nmax[1], input$sens_nmax[2]),
+            res_dist = rv$res_dist,
+            menages = rv$menages,
+            resoudre_fn = resoudre_lrp,
+            nb_vehicules = input$nb_vehicules,
+            cap_camion = input$cap_camion,
+            cap_point = input$cap_point,
+            d_max = input$d_max,
+            solveur = input$solveur,
+            time_limit = 30  # Temps réduit pour la sensibilité
+        )
+        
+        graphe_sensibilite_nmax(df_sens, nmax_ref = rv$solution$nb_points)
     })
     
     # ── Distance par véhicule ──────────────────────────────────
@@ -563,7 +642,7 @@ server <- function(input, output, session) {
             geom_text(aes(label = paste0(round(distance, 1), " km")),
                       vjust = -0.4, size = 4, fontface = "bold") +
             scale_fill_manual(values = COLORS[seq_len(nrow(df_v))]) +
-            labs(title = "Distance parcourue par véhicule", x = NULL, y = "Distance (km)") +
+            labs(title = "Distance parcourue par véhicule (OSM)", x = NULL, y = "Distance (km)") +
             theme_minimal(base_size = 13) +
             theme(panel.grid.major.x = element_blank())
     })
@@ -573,10 +652,11 @@ server <- function(input, output, session) {
         etape1 <- !is.null(rv$menages)
         etape2 <- !is.null(rv$candidats)
         etape3 <- !is.null(rv$solution)
-        etape4 <- rv$matrice_chargee
+        etape4 <- rv$matrice_chargee && !is.null(rv$res_dist$source) && rv$res_dist$source == "osm"
         
         span_ok <- function(txt) tags$span(class = "badge-ok", txt)
         span_wait <- function(txt) tags$span(class = "badge-wait", txt)
+        span_error <- function(txt) tags$span(class = "badge-error", txt)
         
         tagList(
             tags$p(style = "margin:3px 0;",
@@ -584,7 +664,7 @@ server <- function(input, output, session) {
             tags$p(style = "margin:3px 0;",
                    if (etape2) span_ok("\u2713 Clustering") else span_wait("\u25cb Clustering")),
             tags$p(style = "margin:3px 0;",
-                   if (etape4) span_ok("\u2713 Matrice OSM") else span_wait("\u25cb Matrice OSM")),
+                   if (etape4) span_ok("\u2713 Matrice OSM") else if (rv$matrice_chargee) span_error("\u2717 Matrice non OSM") else span_wait("\u25cb Matrice OSM")),
             tags$p(style = "margin:3px 0;",
                    if (etape3) span_ok("\u2713 Optimisation") else span_wait("\u25cb Optimisation"))
         )
