@@ -233,13 +233,10 @@ matrice_distances_osm <- function(candidats,
 #' @return Liste des géométries
 #' @export
 geometries_tournees_osm <- function(sol_z, res_dist) {
-    
-    # Vérifications initiales
     if (is.null(sol_z) || nrow(sol_z) == 0) {
         message("[OSM] ⚠️ Aucun arc à tracer")
         return(NULL)
     }
-    
     if (is.null(res_dist$graphe)) {
         message("[OSM] ⚠️ Pas de graphe OSM dans res_dist")
         return(NULL)
@@ -253,14 +250,11 @@ geometries_tournees_osm <- function(sol_z, res_dist) {
         return(NULL)
     }
     
-    message("[OSM] geometries_tournees_osm appelé")
-    message("[OSM] Nombre d'arcs : ", nrow(sol_z))
+    message("[OSM] geometries_tournees_osm appelé, ", nrow(sol_z), " arcs")
     
-    resultats <- list()
-    
-    # Récupérer les sommets du graphe – utilise la vraie fonction du package
+    # Récupérer les sommets du graphe
     verts <- tryCatch({
-        dodgr_vertices(graphe)   # ← maintenant résout vers le package
+        dodgr_vertices(graphe)
     }, error = function(e) {
         message("[OSM] ⚠️ Erreur dodgr_vertices : ", e$message)
         NULL
@@ -268,127 +262,152 @@ geometries_tournees_osm <- function(sol_z, res_dist) {
     
     if (is.null(verts)) {
         message("[OSM] ⚠️ Impossible d'extraire les sommets, fallback lignes droites")
-        # Fallback : créer des géométries en ligne droite
-        for (k in seq_len(nrow(sol_z))) {
-            v_id <- sol_z$v[k]
-            i <- sol_z$i[k]
-            j <- sol_z$j[k]
-            
-            pt_i <- coords_snap[coords_snap$index == i, ]
-            pt_j <- coords_snap[coords_snap$index == j, ]
-            
-            if (nrow(pt_i) == 0 || nrow(pt_j) == 0) next
-            
-            geom <- st_linestring(matrix(
-                c(pt_i$snap_lon[1], pt_i$snap_lat[1],
-                  pt_j$snap_lon[1], pt_j$snap_lat[1]),
-                ncol = 2, byrow = TRUE
-            ))
-            
-            resultats[[k]] <- list(
-                v = v_id,
-                i = i,
-                j = j,
-                label_i = pt_i$label[1],
-                label_j = pt_j$label[1],
-                distance_km = round(res_dist$d_matrix[i, j], 3),
-                geometry = geom
-            )
-        }
-        return(resultats)
+        return(fallback_lignes_droites(sol_z, res_dist))
     }
+    
+    # Fonction pour snapper un point si nécessaire
+    snap_point <- function(idx, coords_snap, graphe, verts) {
+        # Récupérer la ligne correspondante
+        ligne <- coords_snap[coords_snap$index == idx, ]
+        if (nrow(ligne) == 0) {
+            return(NULL)
+        }
+        # Si le node_id est déjà présent et existe dans verts, on le garde
+        if (!is.na(ligne$node_id) && ligne$node_id %in% verts$id) {
+            return(list(
+                node_id = ligne$node_id,
+                lon = ligne$snap_lon,
+                lat = ligne$snap_lat,
+                label = ligne$label
+            ))
+        }
+        # Sinon, on le snap à nouveau avec dodgr_snap_points
+        message("[OSM] 🔄 Snapping du point ", idx, " (", ligne$label, ")")
+        pt <- data.frame(x = ligne$longitude, y = ligne$latitude)
+        snapped <- tryCatch({
+            dodgr_snap_points(graphe, pt, max_dist = 5000)  # 5 km de tolérance
+        }, error = function(e) {
+            NULL
+        })
+        if (!is.null(snapped) && !is.na(snapped$x) && !is.na(snapped$y)) {
+            # Trouver le node_id correspondant
+            # On cherche le noeud le plus proche de snapped
+            dists <- (verts$x - snapped$x)^2 + (verts$y - snapped$y)^2
+            idx_min <- which.min(dists)
+            node_id <- verts$id[idx_min]
+            return(list(
+                node_id = node_id,
+                lon = snapped$x,
+                lat = snapped$y,
+                label = ligne$label
+            ))
+        } else {
+            # Fallback : utiliser les coordonnées originales et trouver le noeud le plus proche
+            pt_orig <- c(ligne$longitude, ligne$latitude)
+            dists <- (verts$x - pt_orig[1])^2 + (verts$y - pt_orig[2])^2
+            idx_min <- which.min(dists)
+            node_id <- verts$id[idx_min]
+            return(list(
+                node_id = node_id,
+                lon = verts$x[idx_min],
+                lat = verts$y[idx_min],
+                label = ligne$label
+            ))
+        }
+    }
+    
+    resultats <- list()
     
     for (k in seq_len(nrow(sol_z))) {
         v_id <- sol_z$v[k]
         i <- sol_z$i[k]
         j <- sol_z$j[k]
         
-        # Récupérer les points snappés
-        pt_i <- coords_snap[coords_snap$index == i, ]
-        pt_j <- coords_snap[coords_snap$index == j, ]
+        # Snapper les deux points si nécessaire
+        from <- snap_point(i, coords_snap, graphe, verts)
+        to   <- snap_point(j, coords_snap, graphe, verts)
         
-        # Si les points ne sont pas snappés, utiliser les coordonnées originales
-        if (nrow(pt_i) == 0 || is.na(pt_i$snap_lon[1])) {
-            pt_i <- data.frame(
-                index = i,
-                snap_lon = coords_snap$longitude[coords_snap$index == i],
-                snap_lat = coords_snap$latitude[coords_snap$index == i],
-                label = coords_snap$label[coords_snap$index == i]
-            )
-        }
-        if (nrow(pt_j) == 0 || is.na(pt_j$snap_lon[1])) {
-            pt_j <- data.frame(
-                index = j,
-                snap_lon = coords_snap$longitude[coords_snap$index == j],
-                snap_lat = coords_snap$latitude[coords_snap$index == j],
-                label = coords_snap$label[coords_snap$index == j]
-            )
-        }
-        
-        if (nrow(pt_i) == 0 || nrow(pt_j) == 0) {
-            message("[OSM] ⚠️ Points manquants pour l'arc ", i, " → ", j)
+        if (is.null(from) || is.null(to)) {
+            message("[OSM] ⚠️ Impossible de snapper l'arc ", i, " → ", j)
             next
         }
         
-        from_pts <- as.matrix(pt_i[, c("snap_lon", "snap_lat")])
-        to_pts <- as.matrix(pt_j[, c("snap_lon", "snap_lat")])
-        
-        # Essayer plusieurs méthodes pour obtenir le chemin
+        # Essayer d'obtenir le chemin OSM
         geom <- NULL
         
-        # Méthode 1 : dodgr_paths avec les points snappés
+        # Méthode 1 : avec les node_id
         chemin <- tryCatch({
-            dodgr_paths(graphe, from = from_pts, to = to_pts)
-        }, error = function(e) {
-            NULL
-        })
+            dodgr_paths(graphe, from = from$node_id, to = to$node_id)
+        }, error = function(e) NULL)
         
         if (!is.null(chemin) && length(chemin) > 0 && length(chemin[[1]]) > 0 && length(chemin[[1]][[1]]) > 1) {
             ids_path <- chemin[[1]][[1]]
-            # Maintenant verts a les vrais IDs, la correspondance fonctionne
             coords_path <- verts[match(ids_path, verts$id), c("x", "y")]
             coords_path <- coords_path[!is.na(coords_path$x), ]
-            
             if (nrow(coords_path) > 1) {
                 geom <- st_linestring(as.matrix(coords_path))
             }
         }
         
-        # Méthode 2 : Si échec, essayer de trouver un chemin entre les nœuds les plus proches
+        # Méthode 2 : avec les coordonnées snappées (si précédent a échoué)
         if (is.null(geom)) {
-            # Trouver les nœuds les plus proches des points
-            idx_from <- which.min((verts$x - from_pts[1])^2 + (verts$y - from_pts[2])^2)
-            idx_to <- which.min((verts$x - to_pts[1])^2 + (verts$y - to_pts[2])^2)
-            
-            from_pts2 <- as.matrix(verts[idx_from, c("x", "y")])
-            to_pts2 <- as.matrix(verts[idx_to, c("x", "y")])
-            
+            from_pts <- matrix(c(from$lon, from$lat), ncol=2)
+            to_pts   <- matrix(c(to$lon, to$lat), ncol=2)
             chemin2 <- tryCatch({
-                dodgr_paths(graphe, from = from_pts2, to = to_pts2)
-            }, error = function(e) {
-                NULL
-            })
-            
+                dodgr_paths(graphe, from = from_pts, to = to_pts)
+            }, error = function(e) NULL)
             if (!is.null(chemin2) && length(chemin2) > 0 && length(chemin2[[1]]) > 0 && length(chemin2[[1]][[1]]) > 1) {
                 ids_path <- chemin2[[1]][[1]]
                 coords_path <- verts[match(ids_path, verts$id), c("x", "y")]
                 coords_path <- coords_path[!is.na(coords_path$x), ]
-                
                 if (nrow(coords_path) > 1) {
                     geom <- st_linestring(as.matrix(coords_path))
                 }
             }
         }
         
-        # Fallback final : ligne droite
+        # Méthode 3 : fallback ligne droite avec avertissement
         if (is.null(geom)) {
+            message("[OSM] ⚠️ Aucun chemin OSM trouvé pour l'arc ", i, " → ", j, " (véhicule ", v_id, "). Ligne droite utilisée.")
             geom <- st_linestring(matrix(
-                c(pt_i$snap_lon[1], pt_i$snap_lat[1],
-                  pt_j$snap_lon[1], pt_j$snap_lat[1]),
+                c(from$lon, from$lat,
+                  to$lon,   to$lat),
                 ncol = 2, byrow = TRUE
             ))
         }
         
+        resultats[[k]] <- list(
+            v = v_id,
+            i = i,
+            j = j,
+            label_i = from$label,
+            label_j = to$label,
+            distance_km = round(res_dist$d_matrix[i, j], 3),
+            geometry = geom
+        )
+    }
+    
+    message("[OSM] geometries_tournees_osm terminé : ", length(resultats), " géométries")
+    return(resultats)
+}
+
+# Fonction de fallback pour les lignes droites (reprise de l'existant)
+fallback_lignes_droites <- function(sol_z, res_dist) {
+    coords_snap <- res_dist$coords_snap
+    resultats <- list()
+    for (k in seq_len(nrow(sol_z))) {
+        v_id <- sol_z$v[k]
+        i <- sol_z$i[k]
+        j <- sol_z$j[k]
+        pt_i <- coords_snap[coords_snap$index == i, ]
+        pt_j <- coords_snap[coords_snap$index == j, ]
+        if (nrow(pt_i) == 0 || nrow(pt_j) == 0) next
+        # Utiliser snap_lon/lat si disponible, sinon longitude/latitude
+        lon_i <- if (!is.na(pt_i$snap_lon[1])) pt_i$snap_lon[1] else pt_i$longitude[1]
+        lat_i <- if (!is.na(pt_i$snap_lat[1])) pt_i$snap_lat[1] else pt_i$latitude[1]
+        lon_j <- if (!is.na(pt_j$snap_lon[1])) pt_j$snap_lon[1] else pt_j$longitude[1]
+        lat_j <- if (!is.na(pt_j$snap_lat[1])) pt_j$snap_lat[1] else pt_j$latitude[1]
+        geom <- st_linestring(matrix(c(lon_i, lat_i, lon_j, lat_j), ncol=2, byrow=TRUE))
         resultats[[k]] <- list(
             v = v_id,
             i = i,
@@ -399,8 +418,6 @@ geometries_tournees_osm <- function(sol_z, res_dist) {
             geometry = geom
         )
     }
-    
-    message("[OSM] geometries_tournees_osm terminé : ", length(resultats), " géométries")
     return(resultats)
 }
 
