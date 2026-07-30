@@ -13,7 +13,9 @@
 #    palette_vehicules()         : couleurs cohérentes avec la carte
 #    ordre_tournee()             : reconstitue la séquence ordonnée des arcs
 #    enrichir_tournees()         : ajoute labels et distances lisibles
-#    sensibilite_nmax()          : calcule la courbe distance ~ Nmax
+#    sensibilite_nmax()          : calcule la courbe distance/couverture ~ Nmax
+#    graphe_sensibilite_nmax()   : ggplot distance ~ Nmax
+#    graphe_couverture_nmax()    : ggplot couverture réelle (%) ~ Nmax
 # ============================================================
 
 library(dplyr)
@@ -179,6 +181,7 @@ kpis_solution <- function(sol) {
         nb_points_ouverts = sol$nb_points,
         nb_vehicules      = sol$nb_vehicules,
         couverture_pct    = sol$couverture,
+        nb_non_couverts   = sol$nb_non_couverts,
         distance_moyenne  = round(mean(dist_v), 2),
         distance_max_veh  = round(max(dist_v),  2),
         distance_min_veh  = round(min(dist_v[dist_v > 0]), 2)
@@ -351,6 +354,9 @@ sensibilite_nmax <- function(sol,
     
     if (!is.null(resoudre_fn) && !is.null(res_dist) && !is.null(menages)) {
         # ── Mode complet : ré-optimisation ─────────────────────
+        # Comme d_max n'est plus une contrainte dure dans le MIP, chaque
+        # ré-optimisation reste toujours faisable — on capture ici la
+        # couverture réelle en plus de la distance, pour chaque Nmax testé.
         results <- lapply(nmax_vals, function(nm) {
             sol_nm <- tryCatch(
                 resoudre_fn(res_dist = res_dist, menages = menages,
@@ -358,9 +364,17 @@ sensibilite_nmax <- function(sol,
                 error = function(e) NULL
             )
             if (is.null(sol_nm)) {
-                data.frame(nmax = nm, distance_km = NA_real_, source = "erreur")
+                data.frame(nmax = nm, distance_km = NA_real_,
+                           couverture_pct = NA_real_,
+                           couverture_max_pct = NA_real_,
+                           nb_non_couverts = NA_integer_,
+                           source = "erreur")
             } else {
-                data.frame(nmax = nm, distance_km = sol_nm$cout_total, source = "reel")
+                data.frame(nmax = nm, distance_km = sol_nm$cout_total,
+                           couverture_pct = sol_nm$couverture,
+                           couverture_max_pct = sol_nm$couverture_max_atteignable,
+                           nb_non_couverts = sol_nm$nb_non_couverts,
+                           source = "reel")
             }
         })
         do.call(rbind, results)
@@ -385,9 +399,12 @@ sensibilite_nmax <- function(sol,
         dists <- pmax(dists, 0)
         
         data.frame(
-            nmax        = nmax_vals,
-            distance_km = round(dists, 2),
-            source      = "interpolé"
+            nmax                = nmax_vals,
+            distance_km         = round(dists, 2),
+            couverture_pct      = NA_real_,  # non disponible sans ré-optimisation réelle
+            couverture_max_pct  = NA_real_,
+            nb_non_couverts     = NA_integer_,
+            source              = "interpolé"
         )
     }
 }
@@ -433,6 +450,58 @@ graphe_distance_vehicules <- function(sol) {
 #
 #  Retourne : objet ggplot
 # ------------------------------------------------------------
+
+# ------------------------------------------------------------
+#  graphe_couverture_nmax()
+#  Construit le ggplot du taux de couverture réel en fonction du
+#  budget Nmax — permet d'identifier visuellement à partir de
+#  quel Nmax on atteint une couverture cible (ex. 95% ou 100%).
+#
+#  Arguments :
+#    df_sens  : data.frame retourné par sensibilite_nmax() en
+#               mode complet (colonne couverture_pct non-NA)
+#    nmax_ref : valeur Nmax de la solution actuelle (repère)
+#    seuil    : ligne horizontale de couverture cible (défaut 100)
+#
+#  Retourne : objet ggplot
+# ------------------------------------------------------------
+
+graphe_couverture_nmax <- function(df_sens, nmax_ref = NULL, seuil = 100) {
+    if (all(is.na(df_sens$couverture_pct))) {
+        return(
+            ggplot() +
+                annotate("text", x = 0.5, y = 0.5,
+                         label = "Couverture réelle indisponible\n(relancer en mode ré-optimisation complète)",
+                         size = 4.5) +
+                theme_void()
+        )
+    }
+    
+    p <- ggplot(df_sens, aes(x = nmax, y = couverture_pct)) +
+        geom_hline(yintercept = seuil, linetype = "dotted",
+                   color = "grey50", linewidth = 0.6) +
+        geom_line(aes(y = couverture_max_pct), color = "#BDBDBD",
+                  linewidth = 0.9, linetype = "22", na.rm = TRUE) +
+        geom_line(color = "#1D9E75", linewidth = 1, na.rm = TRUE) +
+        geom_point(color = "#D85A30", size = 3, na.rm = TRUE) +
+        scale_y_continuous(limits = c(0, 100)) +
+        labs(title = "Taux de couverture réel selon le budget Nmax",
+             subtitle = paste0("Ligne pleine verte : couverture réelle (étape B) — ",
+                               "ligne grise pointillée : plafond théorique (étape A)"),
+             x = "Nmax (nb points autorisés)",
+             y = "Couverture (%)") +
+        theme_minimal(base_size = 13)
+    
+    if (!is.null(nmax_ref)) {
+        p <- p + geom_vline(xintercept = nmax_ref,
+                            linetype = "dashed", color = "#378ADD", linewidth = 0.8) +
+            annotate("text", x = nmax_ref + 0.3, y = 8,
+                     label = paste0("Solution\nactuelle\n(Nmax=", nmax_ref, ")"),
+                     color = "#378ADD", size = 3.2, hjust = 0)
+    }
+    p
+}
+
 
 graphe_sensibilite_nmax <- function(df_sens, nmax_ref = NULL) {
     p <- ggplot(df_sens, aes(x = nmax, y = distance_km)) +

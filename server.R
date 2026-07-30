@@ -95,6 +95,67 @@ server <- function(input, output, session) {
     #  ONGLET 2 — CLUSTERING
     # ══════════════════════════════════════════════════════════
     
+    # ── Suggestion automatique de k_min / k_max ─────────────────
+    # k_min : plancher physique — nb minimal de clusters pour respecter
+    #         la capacité par point (cap_point), sinon la contrainte de
+    #         charge est mathématiquement infaisable quel que soit k.
+    # k_max : le plus petit des trois plafonds suivants :
+    #   (a) 3x le budget max envisagé (input$n_max), pour garder de la
+    #       marge de choix au MILP (cf. discussion Nmax/couverture) ;
+    #   (b) taille d'échantillon / taille minimale raisonnable d'un
+    #       cluster (20 ménages, ajustable) — évite des clusters
+    #       microscopiques sans réalité opérationnelle ;
+    #   (c) plafond de tractabilité du solveur exact (par défaut 50).
+    TAILLE_MIN_CLUSTER  <- 20   # ménages/cluster, seuil ajustable
+    K_MAX_SOLVEUR       <- 50   # plafond de tractabilité MILP
+    LAMBDA_MARGE_BUDGET <- 3    # k_max >= lambda * n_max souhaité
+    
+    observe({
+        req(rv$menages, input$cap_point)
+        
+        poids_total <- sum(rv$menages$poids_dechets)
+        m_menages   <- nrow(rv$menages)
+        
+        # (k_min) plancher physique lié à la capacité
+        k_min_sugg <- ceiling(poids_total / input$cap_point)
+        k_min_sugg <- max(k_min_sugg, 2)  # au moins 2 clusters
+        
+        # (k_max) trois plafonds combinés
+        plafond_taille <- floor(m_menages / TAILLE_MIN_CLUSTER)
+        plafond_budget <- if (!is.null(input$n_max) && input$n_max > 0) {
+            LAMBDA_MARGE_BUDGET * input$n_max
+        } else {
+            NA_integer_
+        }
+        plafond_solveur <- K_MAX_SOLVEUR
+        
+        k_max_sugg <- min(c(plafond_taille, plafond_budget, plafond_solveur),
+                          na.rm = TRUE)
+        
+        # Garde-fou : si les contraintes se contredisent (k_max < k_min),
+        # on élargit k_max plutôt que de bloquer l'utilisateur, avec alerte.
+        if (k_max_sugg < k_min_sugg) {
+            showNotification(
+                paste0("⚠️ cap_point trop faible pour la taille min. de cluster (",
+                       TAILLE_MIN_CLUSTER, " ménages) : k_max ajusté à k_min + 5."),
+                type = "warning"
+            )
+            k_max_sugg <- k_min_sugg + 5
+        }
+        
+        message("[Clustering] k_min suggéré = ", k_min_sugg,
+                " | k_max suggéré = ", k_max_sugg,
+                " (plafonds : taille=", plafond_taille,
+                ", budget=", plafond_budget,
+                ", solveur=", plafond_solveur, ")")
+        
+        updateSliderInput(session, "k_min",
+                          min = 2, max = k_max_sugg, value = k_min_sugg)
+        updateSliderInput(session, "k_max",
+                          min = k_min_sugg, max = max(k_max_sugg, K_MAX_SOLVEUR),
+                          value = k_max_sugg)
+    })
+    
     observeEvent(input$lancer_cluster, {
         req(rv$menages)
         
@@ -351,7 +412,12 @@ server <- function(input, output, session) {
                     d_max = input$d_max,
                     n_max = input$n_max,
                     solveur = input$solveur,
-                    time_limit = input$time_limit
+                    time_limit = input$time_limit,
+                    tol_couverture = if (!is.null(input$tol_couverture)) {
+                        input$tol_couverture
+                    } else {
+                        0  # valeur par défaut si le slider n'est pas encore dans l'UI
+                    }
                 ),
                 error = function(e) {
                     showNotification(paste("Erreur solveur :", e$message), type = "error")
@@ -364,9 +430,14 @@ server <- function(input, output, session) {
                 rv$log_optim <- paste0(
                     "Solveur : ", input$solveur, "\n",
                     "Statut : ", sol$statut, "\n",
-                    "Objectif : ", sol$cout_total, " km\n",
+                    "Distance des tournées (étape B) : ", sol$cout_total, " m\n",
+                    "Couverture max. atteignable (étape A, plafond) : ",
+                    sol$couverture_max_atteignable, " %\n",
+                    "Tolérance couverture utilisée : ", sol$tol_couverture_utilisee, " ménage(s)\n",
                     "Points ouverts : ", sol$nb_points, "\n",
-                    "Couverture : ", sol$couverture, " %\n\n",
+                    "Véhicules utilisés : ", sol$nb_vehicules_utilises, " / ", sol$nb_vehicules, "\n",
+                    "Couverture réelle obtenue : ", sol$couverture, " % (",
+                    sol$nb_non_couverts, " ménage(s) au-delà de D_max)\n\n",
                     "Distance par véhicule :\n",
                     paste(names(sol$distances_par_vehicule),
                           round(sol$distances_par_vehicule, 2), "km",
@@ -394,21 +465,37 @@ server <- function(input, output, session) {
     output$log_solveur <- renderPrint({ cat(rv$log_optim) })
     
     output$contraintes_actives <- renderPrint({
-        cat("C1  : Σⱼ z^v_Oj = 1             ∀v  (départ dépôt)\n")
-        cat("C2  : Σᵢ z^v_iS = 1             ∀v  (arrivée décharge)\n")
+        cat("── ÉTAPE A (couverture maximale, modèle léger) ──────────\n")
+        cat("CA1 : Σⱼ xᵢⱼ = 1                    ∀i  (affectation unique)\n")
+        cat("CA2 : xᵢⱼ ≤ yⱼ                      ∀i,j (seulement si ouvert)\n")
+        cat("CA3 : Σⱼ yⱼ ≤ Nmax                       (budget)\n")
+        cat("CA4 : Σᵢ wᵢ·xᵢⱼ ≤ Cⱼ·yⱼ              ∀j  (capacité point)\n")
+        cat("CA5 : cᵢ ≤ Σ_{j: dᵢⱼ≤Dmax} xᵢⱼ        ∀i  (couverture)\n")
+        cat("      objectif : max Σᵢ cᵢ  →  couverture_max\n\n")
+        cat("── ÉTAPE B (routage optimal, modèle complet) ────────────\n")
+        cat("C1  : Σⱼ z^v_Oj ≤ 1              ∀v  (départ optionnel)\n")
+        cat("C2  : Σᵢ z^v_iS ≤ 1              ∀v  (arrivée optionnelle)\n")
+        cat("C2b : Σⱼ z^v_Oj = Σᵢ z^v_iS      ∀v  (cohérence départ/arrivée)\n")
         cat("C3  : Σᵢ z^v_ij = Σₖ z^v_jk    ∀v,j (conservation flux)\n")
         cat("C4  : Σᵥ Σᵢ z^v_ij = yⱼ        ∀j  (visite si ouvert)\n")
         cat("C5  : z^v_ii = 0                ∀v,i (pas d'auto-boucle)\n")
         cat("C6  : z^v_Sj = 0                ∀v,j (pas d'arc depuis décharge)\n")
         cat("C7  : z^v_iO = 0                ∀v,i (pas d'arc vers dépôt)\n")
-        cat("C8  : Σⱼ xᵢⱼ = 1               ∀i  (affectation unique)\n")
+        cat("C8  : Σⱼ xᵢⱼ = 1               ∀i  (affectation unique — toujours obligatoire,\n")
+        cat("      un ménage est toujours collecté, même au-delà de Dmax)\n")
         cat("C9  : xᵢⱼ ≤ yⱼ                 ∀i,j (seulement si ouvert)\n")
-        cat("C10 : xᵢⱼ = 0 si dᵢⱼ > Dmax   ∀i,j (accessibilité)\n")
+        cat("C10 : cᵢ ≤ Σ_{j: dᵢⱼ≤Dmax} xᵢⱼ   ∀i  (indicateur couverture, idem étape A)\n")
+        cat("C10b: Σᵢ cᵢ ≥ couverture_max - tol_couverture  (couverture garantie,\n")
+        cat("      ancrée sur l'optimum de l'étape A — remplace l'ancienne pénalité\n")
+        cat("      pondérée poids_desserte, abandonnée : cf. document du modèle)\n")
         cat("C11 : Σᵢ wᵢ·xᵢⱼ ≤ Cⱼ·yⱼ       ∀j  (capacité point)\n")
         cat("C12 : Σⱼ yⱼ ≤ Nmax                  (budget)\n")
-        cat("C13 : MTZ  uⱼ ≥ uᵢ + Cⱼ·zᵢⱼ - Qᵥ(1-zᵢⱼ)  (sous-tours)\n")
+        cat("C13 : MTZ  u^v_j ≥ u^v_i + Cⱼ·z^v_ij - Qᵥ(1-z^v_ij)  (sous-tours)\n")
         cat("C14 : u^v_j ≤ Qᵥ               ∀v,j (borne capacité)\n")
-        cat("C15 : u^v_O = 0                ∀v  (dépôt vide au départ)\n")
+        cat("C15 : u^v_O = 0                ∀v  (dépôt vide au départ)\n\n")
+        cat("Objectif étape B : min Σᵥ Σᵢ Σⱼ dᵢⱼ·z^v_ij  (distance des tournées,\n")
+        cat("uniquement — la couverture est déjà garantie par C10b, pas besoin\n")
+        cat("de la mélanger dans l'objectif)\n")
     })
     
     # ══════════════════════════════════════════════════════════
@@ -433,7 +520,9 @@ server <- function(input, output, session) {
     
     output$kpi_vehicules <- renderValueBox({
         valueBox(
-            value = if (!is.null(rv$solution)) rv$solution$nb_vehicules else "—",
+            value = if (!is.null(rv$solution)) {
+                paste0(rv$solution$nb_vehicules_utilises, " / ", rv$solution$nb_vehicules)
+            } else "—",
             subtitle = "Véhicules utilisés",
             icon = icon("truck"), color = "green"
         )
@@ -442,7 +531,12 @@ server <- function(input, output, session) {
     output$kpi_couverture <- renderValueBox({
         valueBox(
             value = if (!is.null(rv$solution)) paste(rv$solution$couverture, "%") else "—",
-            subtitle = "Ménages couverts",
+            subtitle = if (!is.null(rv$solution)) {
+                paste0("Ménages couverts (max atteignable sous ce budget : ",
+                       rv$solution$couverture_max_atteignable, "%)")
+            } else {
+                "Ménages couverts"
+            },
             icon = icon("home"), color = "purple"
         )
     })
@@ -621,7 +715,9 @@ server <- function(input, output, session) {
             cap_point = input$cap_point,
             d_max = input$d_max,
             solveur = input$solveur,
-            time_limit = 30  # Temps réduit pour la sensibilité
+            time_limit = 30,             # Temps réduit pour la sensibilité (étape B)
+            time_limit_couverture = 15,  # Temps réduit pour l'étape A
+            tol_couverture = if (!is.null(input$tol_couverture)) input$tol_couverture else 0
         )
         
         graphe_sensibilite_nmax(df_sens, nmax_ref = rv$solution$nb_points)
