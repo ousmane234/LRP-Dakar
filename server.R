@@ -106,7 +106,6 @@ server <- function(input, output, session) {
     #       cluster (20 ménages, ajustable) — évite des clusters
     #       microscopiques sans réalité opérationnelle ;
     #   (c) plafond de tractabilité du solveur exact (par défaut 50).
-    TAILLE_MIN_CLUSTER  <- 20   # ménages/cluster, seuil ajustable
     K_MAX_SOLVEUR       <- 50   # plafond de tractabilité MILP
     LAMBDA_MARGE_BUDGET <- 3    # k_max >= lambda * n_max souhaité
     
@@ -116,12 +115,22 @@ server <- function(input, output, session) {
         poids_total <- sum(rv$menages$poids_dechets)
         m_menages   <- nrow(rv$menages)
         
+        # Taille minimale de cluster : pilotable via input$taille_min_cluster
+        # si le contrôle existe dans l'UI, sinon repli sur une valeur adaptée
+        # à la taille de l'échantillon (evite qu'un seuil fixe de 20 écrase
+        # k_max sur de petits jeux de données, ex. 135 menages -> k_max=6).
+        taille_min_cluster <- if (!is.null(input$taille_min_cluster)) {
+            input$taille_min_cluster
+        } else {
+            max(5, round(m_menages / 15))  # ~15 clusters de taille egale par defaut
+        }
+        
         # (k_min) plancher physique lié à la capacité
         k_min_sugg <- ceiling(poids_total / input$cap_point)
         k_min_sugg <- max(k_min_sugg, 2)  # au moins 2 clusters
         
         # (k_max) trois plafonds combinés
-        plafond_taille <- floor(m_menages / TAILLE_MIN_CLUSTER)
+        plafond_taille <- floor(m_menages / taille_min_cluster)
         plafond_budget <- if (!is.null(input$n_max) && input$n_max > 0) {
             LAMBDA_MARGE_BUDGET * input$n_max
         } else {
@@ -137,12 +146,13 @@ server <- function(input, output, session) {
         if (k_max_sugg < k_min_sugg) {
             showNotification(
                 paste0("⚠️ cap_point trop faible pour la taille min. de cluster (",
-                       TAILLE_MIN_CLUSTER, " ménages) : k_max ajusté à k_min + 5."),
+                       taille_min_cluster, " ménages) : k_max ajusté à k_min + 5."),
                 type = "warning"
             )
             k_max_sugg <- k_min_sugg + 5
         }
         
+        message("[Clustering] taille_min_cluster utilisee = ", taille_min_cluster)
         message("[Clustering] k_min suggéré = ", k_min_sugg,
                 " | k_max suggéré = ", k_max_sugg,
                 " (plafonds : taille=", plafond_taille,
@@ -430,7 +440,7 @@ server <- function(input, output, session) {
                 rv$log_optim <- paste0(
                     "Solveur : ", input$solveur, "\n",
                     "Statut : ", sol$statut, "\n",
-                    "Distance des tournées (étape B) : ", sol$cout_total, " m\n",
+                    "Distance des tournées (étape B) : ", sol$cout_total, " km\n",
                     "Couverture max. atteignable (étape A, plafond) : ",
                     sol$couverture_max_atteignable, " %\n",
                     "Tolérance couverture utilisée : ", sol$tol_couverture_utilisee, " ménage(s)\n",
@@ -702,23 +712,48 @@ server <- function(input, output, session) {
     
     # ── Analyse de sensibilité ──────────────────────────────────
     output$graphe_sensibilite <- renderPlot({
-        req(rv$solution, rv$res_dist, rv$menages)
+        req(rv$solution, rv$res_dist, rv$menages, rv$candidats)
         
-        df_sens <- sensibilite_nmax(
-            sol = rv$solution,
-            nmax_vals = seq(input$sens_nmax[1], input$sens_nmax[2]),
-            res_dist = rv$res_dist,
-            menages = rv$menages,
-            resoudre_fn = resoudre_lrp,
-            nb_vehicules = input$nb_vehicules,
-            cap_camion = input$cap_camion,
-            cap_point = input$cap_point,
-            d_max = input$d_max,
-            solveur = input$solveur,
-            time_limit = 30,             # Temps réduit pour la sensibilité (étape B)
-            time_limit_couverture = 15,  # Temps réduit pour l'étape A
-            tol_couverture = if (!is.null(input$tol_couverture)) input$tol_couverture else 0
-        )
+        nb_candidats <- nrow(rv$candidats)
+        nmax_demande <- seq(input$sens_nmax[1], input$sens_nmax[2])
+        
+        # Au-delà de nb_candidats, Σy_j <= n_max cesse d'être contraignante
+        # (il n'y a tout simplement plus de points à ouvrir) -- la courbe
+        # plafonne nécessairement à partir de là. Avertir plutôt que de
+        # laisser croire à un bug si la plage demandée dépasse ce seuil.
+        if (max(nmax_demande) > nb_candidats) {
+            showNotification(
+                paste0("ℹ️ Seulement ", nb_candidats, " points candidats disponibles : ",
+                       "la courbe sera plate au-delà de Nmax=", nb_candidats,
+                       " (relancer le clustering avec un k_max plus élevé pour tester plus loin)."),
+                type = "message", duration = 8
+            )
+        }
+        nmax_vals <- nmax_demande[nmax_demande <= max(nb_candidats, nmax_demande[1])]
+        if (length(nmax_vals) == 0) nmax_vals <- nmax_demande
+        
+        n_total <- length(nmax_vals)
+        withProgress(message = "Analyse de sensibilité (Nmax)...", value = 0, {
+            df_sens <- sensibilite_nmax(
+                sol = rv$solution,
+                nmax_vals = nmax_vals,
+                res_dist = rv$res_dist,
+                menages = rv$menages,
+                resoudre_fn = resoudre_lrp,
+                progress_cb = function(k, n, nm) {
+                    incProgress(1 / n_total,
+                                detail = paste0(k, "/", n_total, " (Nmax=", nm, ")"))
+                },
+                nb_vehicules = input$nb_vehicules,
+                cap_camion = input$cap_camion,
+                cap_point = input$cap_point,
+                d_max = input$d_max,
+                solveur = input$solveur,
+                time_limit = 30,             # Temps réduit pour la sensibilité (étape B)
+                time_limit_couverture = 15,  # Temps réduit pour l'étape A
+                tol_couverture = if (!is.null(input$tol_couverture)) input$tol_couverture else 0
+            )
+        })
         
         graphe_sensibilite_nmax(df_sens, nmax_ref = rv$solution$nb_points)
     })

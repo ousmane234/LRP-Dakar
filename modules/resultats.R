@@ -347,6 +347,7 @@ sensibilite_nmax <- function(sol,
                              res_dist    = NULL,
                              menages     = NULL,
                              resoudre_fn = NULL,
+                             progress_cb = NULL,
                              ...) {
     
     ref_nmax <- sol$nb_points
@@ -357,12 +358,22 @@ sensibilite_nmax <- function(sol,
         # Comme d_max n'est plus une contrainte dure dans le MIP, chaque
         # ré-optimisation reste toujours faisable — on capture ici la
         # couverture réelle en plus de la distance, pour chaque Nmax testé.
-        results <- lapply(nmax_vals, function(nm) {
+        # ATTENTION : ceci relance une résolution MILP complète (étapes A+B)
+        # pour CHAQUE valeur de nmax_vals -- avec time_limit=30s et
+        # time_limit_couverture=15s par defaut, un balayage de 10 valeurs
+        # peut prendre plusieurs minutes. progress_cb (optionnel) permet
+        # de donner un retour visuel pendant ce temps.
+        n_total <- length(nmax_vals)
+        results <- lapply(seq_along(nmax_vals), function(k) {
+            nm <- nmax_vals[k]
             sol_nm <- tryCatch(
                 resoudre_fn(res_dist = res_dist, menages = menages,
                             n_max = nm, ...),
                 error = function(e) NULL
             )
+            if (!is.null(progress_cb)) {
+                progress_cb(k, n_total, nm)
+            }
             if (is.null(sol_nm)) {
                 data.frame(nmax = nm, distance_km = NA_real_,
                            couverture_pct = NA_real_,

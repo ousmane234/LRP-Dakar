@@ -53,13 +53,13 @@ ui <- dashboardPage(
                     hr(),
                     h5(icon("sliders"), " Paramètres capacitaires"),
                     numericInput("cap_point",  "Capacité point de collecte Cⱼ (kg)",
-                                 value = 500, min = 100, step = 50),
+                                 value = 3000, min = 100, step = 50),
                     numericInput("cap_camion", "Capacité camion Qᵥ (kg)",
-                                 value = 1000, min = 100, step = 50),
+                                 value = 10000, min = 100, step = 50),
                     numericInput("d_max",      "Distance max ménage → point Dmax (m)",
-                                 value = 500, min = 50, step = 50),
+                                 value = 600, min = 50, step = 50),
                     numericInput("n_max",      "Budget : nb max de points Nmax",
-                                 value = 10, min = 1),
+                                 value = 30, min = 1),
                     hr(),
                     actionButton("charger", "Charger les données",
                                  class = "btn-primary btn-block", icon = icon("upload"))
@@ -130,9 +130,9 @@ ui <- dashboardPage(
                     ),
                     fluidRow(
                       column(6, numericInput("decharge_lon_opt", "Décharge — Lon", 
-                                             value = -17.3667, step = 0.0001)),
+                                             value = -17.3133, step = 0.0001)),
                       column(6, numericInput("decharge_lat_opt", "Décharge — Lat", 
-                                             value = 14.7500, step = 0.0001))
+                                             value = 14.8025, step = 0.0001))
                     ),
                     helpText("Ces coordonnées sont utilisées pour le calcul des distances sur le réseau OSM."),
                     hr(),
@@ -149,7 +149,7 @@ ui <- dashboardPage(
                     # ── Paramètres du modèle ──
                     h5(icon("truck"), " Flotte"),
                     numericInput("nb_vehicules", "Nombre de véhicules |V|",
-                                 value = 3, min = 1, max = 20),
+                                 value = 10, min = 1, max = 20),
                     hr(),
                     
                     h5(icon("cogs"), " Solveur"),
